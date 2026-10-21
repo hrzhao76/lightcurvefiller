@@ -74,20 +74,47 @@ func (c LightServeConfiguration) UploadSources(sources []SourceUpload) {
 			log.Panic("Could not marshal source batch to JSON")
 		}
 
-		request, err := http.NewRequest(
-			http.MethodPut,
-			url,
-			bytes.NewBuffer(json_content),
-		)
+		// Observations reference sources by foreign key, so a lost source
+		// batch poisons every later observation upload (permanent FK-violation
+		// 500s). Retry the same way the batch uploaders do instead of logging
+		// and moving on.
+		status_code := 999
+		failures := 0
 
-		if err != nil {
-			log.Panic("Error creating HTTP request")
-		}
+		for status_code != 200 {
+			request, err := http.NewRequest(
+				http.MethodPut,
+				url,
+				bytes.NewBuffer(json_content),
+			)
 
-		res, err := client.Do(request)
+			if err != nil {
+				log.Panic("Error creating HTTP request")
+			}
 
-		if err != nil || res.StatusCode != 200 {
-			log.Println("Failed to send data to /sources/batch endpoint ", res)
+			res, err := client.Do(request)
+
+			if err != nil || res == nil {
+				// client.Do returns a nil Response on connection/DNS
+				// errors; dereferencing res here would SIGSEGV.
+				log.Println("Failed to send data to /sources/batch endpoint ", err)
+			} else {
+				status_code = res.StatusCode
+
+				if status_code != 200 {
+					body, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
+					log.Printf("Error uploading source batch: %d, %s", status_code, body)
+				}
+				res.Body.Close()
+			}
+
+			if status_code != 200 {
+				time.Sleep(time.Duration(failures*5) * time.Second)
+				failures += 1
+				if failures > 5 {
+					log.Panic("Failed over 5 times to send source metadata to API endpoint")
+				}
+			}
 		}
 	}
 }
@@ -124,20 +151,44 @@ func (c LightServeConfiguration) UploadInstruments(telescope Telescope) {
 			log.Panic("Could not marshal instrument to JSON ", instrument)
 		}
 
-		request, err := http.NewRequest(
-			http.MethodPut,
-			url,
-			bytes.NewBuffer(json_content),
-		)
+		// Instruments are PUT once per (telescope, module, frequency); a
+		// non-200 here is usually the duplicate-key 500 from re-running the
+		// filler against a database that already has the instruments (the
+		// upload itself succeeded). Retry only transport errors, where the
+		// instrument was never stored.
+		failures := 0
 
-		if err != nil {
-			log.Panic("Error creating HTTP request")
-		}
+		for {
+			request, err := http.NewRequest(
+				http.MethodPut,
+				url,
+				bytes.NewBuffer(json_content),
+			)
 
-		res, err := client.Do(request)
+			if err != nil {
+				log.Panic("Error creating HTTP request")
+			}
 
-		if err != nil || res.StatusCode != 200 {
-			log.Println("Failed to send data to /instruments/ endpoint ", res, err)
+			res, err := client.Do(request)
+
+			if err != nil || res == nil {
+				// client.Do returns a nil Response on connection/DNS
+				// errors; dereferencing res here would SIGSEGV.
+				log.Println("Failed to send data to /instruments/ endpoint ", err)
+				time.Sleep(time.Duration(failures*5) * time.Second)
+				failures += 1
+				if failures > 5 {
+					log.Panic("Failed over 5 times to send instrument data to API endpoint")
+				}
+				continue
+			}
+
+			if res.StatusCode != 200 {
+				body, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
+				log.Printf("Error uploading instrument (status %d): %s", res.StatusCode, body)
+			}
+			res.Body.Close()
+			break
 		}
 	}
 }
@@ -182,8 +233,14 @@ func uploadDataBatch(
 
 			res, err := client.Do(request)
 
-			if err != nil {
-				log.Println("Failed to send data to /observations/batch endpoint ", res)
+			if err != nil || res == nil {
+				log.Println("Failed to send data to /observations/batch endpoint ", err)
+				time.Sleep(time.Duration(failures*5) * time.Second)
+				failures += 1
+				if failures > 5 {
+					log.Panic("Failed over 5 times to send data to API endpoint")
+				}
+				continue
 			}
 
 			status_code = res.StatusCode
@@ -244,10 +301,17 @@ func uploadCutoutBatch(
 
 			res, err := client.Do(request)
 
-			if err != nil {
-				body, readErr := io.ReadAll(res.Body)
-				res.Body.Close()
-				log.Println("Failed to send data to /observations/batch endpoint", res, body, readErr)
+			if err != nil || res == nil {
+				// client.Do returns a nil Response on connection/DNS
+				// errors; dereferencing res here would SIGSEGV the whole
+				// filler, so back off and retry instead.
+				log.Println("Failed to send data to /observations/batch endpoint", err)
+				time.Sleep(time.Duration(failures*5) * time.Second)
+				failures += 1
+				if failures > 5 {
+					log.Panic("Failed over 5 times to send data to API endpoint")
+				}
+				continue
 			}
 
 			status_code = res.StatusCode
@@ -368,8 +432,11 @@ func (c LightServeConfiguration) UploadParquet(filename string) error {
 	log.Printf("Header Content-Type: %s", request.Header.Get("Content-Type"))
 	res, err := client.Do(request)
 
-	if err != nil {
-		log.Println("Failed to send data to /observations/parquet endpoint ", res)
+	if err != nil || res == nil {
+		// client.Do returns a nil Response on connection/DNS errors;
+		// dereferencing res would SIGSEGV here.
+		log.Println("Failed to send data to /observations/parquet endpoint ", err)
+		return err
 	}
 
 	status_code := res.StatusCode
